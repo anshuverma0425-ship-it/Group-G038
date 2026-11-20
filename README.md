@@ -26,9 +26,6 @@ This project focuses on predicting energy consumption (kWh) during electric vehi
 - `data/raw/` — Dataset files and DVC tracking metadata
 - `src/` — Python source code
 - `reports/` — Data investigation findings
-- `PROBLEM.md` — Project problem statement
-- `GROUP.md` — Group information
-- `STUDENT_HANDBOOK.md` — Project guidelines
 
 ## Tools and Technologies
 
