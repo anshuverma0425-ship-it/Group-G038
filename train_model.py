@@ -1,90 +1,131 @@
 
-import os
-import json
-import joblib
+from pathlib import Path
+import hashlib
+
+import mlflow
+import mlflow.sklearn
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
 
-# Load cleaned data
-data = pd.read_csv("data/train_clean.csv")
 
-target = "energy_kwh"
+ROOT = Path(__file__).resolve().parent
+RAW_DATA = ROOT / "data" / "raw" / "train.csv"
+CLEAN_DATA = ROOT / "data" / "processed" / "train_clean.csv"
 
-numeric_features = [
-    "battery_start_pct",
-    "session_minutes",
-    "charger_kw",
-    "temp_c",
-    "vehicle_age_yr",
-    "queue_before",
-]
+TRACKING_URI = f"sqlite:///{(ROOT / 'mlflow.db').as_posix()}"
+EXPERIMENT_NAME = "MP267_EV_Energy_Prediction"
+MODEL_NAME = "MP267_EV_Energy_Model"
 
-categorical_features = [
-    "vehicle",
-    "station_type",
-]
 
-features = numeric_features + categorical_features
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(8192), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-X = data[features]
-y = data[target]
 
-# Split data: 80% training, 20% validation
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, test_size=0.2, random_state=42
+def main():
+    # Hash the ORIGINAL training dataset, not the cleaned file.
+    data_hash = sha256_file(RAW_DATA)
+
+    df = pd.read_csv(CLEAN_DATA)
+
+    target = "energy_kwh"
+    drop_columns = ["energy_kwh", "record_id", "date"]
+
+    X = df.drop(columns=drop_columns, errors="ignore")
+    y = df[target]
+
+    # Convert categorical columns into numeric columns.
+    X = pd.get_dummies(X, columns=X.select_dtypes(
+        include=["object", "string", "category"]
+    ).columns, dtype=int)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    mlflow.set_tracking_uri(TRACKING_URI)
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    configurations = [
+        {"n_estimators": 100, "max_depth": 10},
+        {"n_estimators": 200, "max_depth": 15},
+        {"n_estimators": 300, "max_depth": None},
+    ]
+
+    results = []
+
+    for index, params in enumerate(configurations, start=1):
+        with mlflow.start_run(run_name=f"RandomForest_Config_{index}") as run:
+            model = RandomForestRegressor(
+                **params,
+                random_state=42,
+                n_jobs=-1
+            )
+
+            model.fit(X_train, y_train)
+            predictions = model.predict(X_test)
+
+            mae = mean_absolute_error(y_test, predictions)
+            r2 = r2_score(y_test, predictions)
+
+            mlflow.log_params(params)
+            mlflow.log_param("model_type", "RandomForestRegressor")
+            mlflow.log_param("data_sha256", data_hash)
+            mlflow.log_metric("mae", mae)
+            mlflow.log_metric("r2_score", r2)
+
+            mlflow.sklearn.log_model(
+    sk_model=model,
+    name="model",
+    skops_trusted_types=["sklearn.tree._tree.Tree"]
 )
+            results.append({
+                "run_id": run.info.run_id,
+                "mae": mae,
+                "model": model,
+                "params": params
+            })
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ("categorical", OneHotEncoder(handle_unknown="ignore"),
-         categorical_features),
-    ],
-    remainder="passthrough",
-)
+            print(f"Config {index}: MAE={mae:.4f}, R2={r2:.4f}")
 
-model = Pipeline([
-    ("preprocessor", preprocessor),
-    ("regressor", RandomForestRegressor(
-        n_estimators=200,
-        random_state=42,
-        n_jobs=-1,
-    )),
-])
+    best = min(results, key=lambda item: item["mae"])
 
-# Train
-model.fit(X_train, y_train)
+    print("\nBest configuration:", best["params"])
+    print("Best MAE:", best["mae"])
+    print("Best run ID:", best["run_id"])
 
-# Evaluate on validation data
-predictions = model.predict(X_val)
+    # Register the best run's logged model.
+    model_uri = f"runs:/{best['run_id']}/model"
 
-metrics = {
-    "validation_rows": int(len(y_val)),
-    "MAE": float(mean_absolute_error(y_val, predictions)),
-    "RMSE": float(mean_squared_error(y_val, predictions) ** 0.5),
-    "R2": float(r2_score(y_val, predictions)),
-}
+    registered = mlflow.register_model(
+        model_uri=model_uri,
+        name=MODEL_NAME
+    )
 
-# Save model and metrics
-os.makedirs("models", exist_ok=True)
+    # Assign the required champion alias.
+    client = mlflow.tracking.MlflowClient()
+    client.set_registered_model_alias(
+        MODEL_NAME,
+        "champion",
+        registered.version
+    )
 
-joblib.dump(model, "models/energy_model.joblib")
+    # Save a local copy for later application use.
+    import joblib
+    models_dir = ROOT / "models"
+    models_dir.mkdir(exist_ok=True)
+    joblib.dump(best["model"], models_dir / "model.joblib")
 
-with open("models/metrics.json", "w") as file:
-    json.dump(metrics, file, indent=4)
+    print("\nRegistered model:", MODEL_NAME)
+    print("Champion version:", registered.version)
+    print("Saved model to:", models_dir / "model.joblib")
 
-print("\nMODEL TRAINING COMPLETE")
-print(f"Training rows: {len(X_train)}")
-print(f"Validation rows: {len(X_val)}")
-print("\nValidation metrics:")
 
-for name, value in metrics.items():
-    print(f"{name}: {value}")
-
-print("\nModel saved: models/energy_model.joblib")
-print("Metrics saved: models/metrics.json")
+if __name__ == "__main__":
+    main()
