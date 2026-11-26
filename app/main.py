@@ -1,12 +1,42 @@
 
+import json
+import logging
+import time
 from pathlib import Path
 from typing import Literal
 
 import joblib
 import pandas as pd
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field, ConfigDict
+
+
+# JSON logging configuration
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+
+        if hasattr(record, "method"):
+            log_data["method"] = record.method
+            log_data["path"] = record.path
+            log_data["status_code"] = record.status_code
+            log_data["duration_ms"] = record.duration_ms
+
+        return json.dumps(log_data)
+
+
+logger = logging.getLogger("mp267")
+logger.setLevel(logging.INFO)
+
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
+logger.addHandler(handler)
+logger.propagate = False
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +60,32 @@ FEATURE_COLUMNS = [
 ]
 
 app = FastAPI(title="MP267 EV Energy Prediction API")
+
+
+# Log every HTTP request in JSON format
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.perf_counter()
+    status_code = 500
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration_ms = round(
+            (time.perf_counter() - start_time) * 1000, 2
+        )
+
+        logger.info(
+            "API request",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": status_code,
+                "duration_ms": duration_ms,
+            },
+        )
 
 
 class PredictionRequest(BaseModel):
